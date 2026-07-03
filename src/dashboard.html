@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen Web2API — 服务仪表盘</title>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --bg:#070b14;--card:#0f172a;--card2:#131c33;--border:rgba(255,255,255,.06);
+    --text:#e2e8f0;--muted:#64748b;--accent:#3b82f6;--accent2:#8b5cf6;
+    --green:#10b981;--red:#ef4444;--yellow:#f59e0b;--cyan:#06b6d4;
+    --radius:16px;--transition:all .25s cubic-bezier(.4,0,.2,1);
+  }
+  body{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+  body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 20% 30%,rgba(59,130,246,.08) 0%,transparent 50%),radial-gradient(circle at 80% 70%,rgba(139,92,246,.06) 0%,transparent 50%);pointer-events:none;z-index:0}
+  #app{position:relative;z-index:1;padding:28px 32px;max-width:1400px;margin:0 auto}
+  .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:36px;flex-wrap:wrap;gap:12px}
+  .header h1{font-size:1.8rem;font-weight:800;letter-spacing:-0.03em;background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  .meta{display:flex;align-items:center;gap:12px;font-size:.8rem;color:var(--muted);flex-wrap:wrap}
+  .status-pill{display:flex;align-items:center;gap:8px;padding:6px 16px;border-radius:999px;border:1px solid var(--border)}
+  .dot{width:8px;height:8px;border-radius:50%}
+  .dot.ok{background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite}
+  .dot.err{background:var(--red)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .btn{padding:5px 14px;border-radius:999px;border:1px solid;cursor:pointer;font-size:.7rem;font-weight:600;transition:all .2s;background:transparent}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .btn-warn{border-color:var(--yellow);color:var(--yellow)}.btn-warn:hover{background:rgba(245,158,11,.15)}
+  .btn-danger{border-color:var(--red);color:var(--red)}.btn-danger:hover{background:rgba(239,68,68,.15)}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px;margin-bottom:28px}
+  .card{background:linear-gradient(135deg,var(--card),var(--card2));border:1px solid var(--border);border-radius:var(--radius);padding:22px;transition:var(--transition);position:relative;overflow:hidden}
+  .card:hover{border-color:rgba(59,130,246,.3);transform:translateY(-2px);box-shadow:0 0 20px rgba(59,130,246,.3)}
+  .card .icon{font-size:1.5rem;margin-bottom:10px}
+  .card .label{font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px}
+  .card .val{font-size:2rem;font-weight:700}
+  .val.g{color:var(--green)}.val.b{color:var(--accent)}.val.r{color:var(--red)}.val.c{color:var(--cyan)}
+
+  .grid2{display:grid;grid-template-columns:2fr 1fr;gap:18px;margin-bottom:28px}
+  .endpoint-row{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--border)}
+  .method{font-size:.7rem;font-weight:700;padding:3px 8px;border-radius:6px;text-transform:uppercase}
+  .method.post{background:rgba(59,130,246,.15);color:var(--accent)}
+  .method.get{background:rgba(16,185,129,.15);color:var(--green)}
+  .ep{font-family:monospace;font-size:.85rem;color:var(--cyan)}
+  .ep-desc{font-size:.75rem;color:var(--muted);flex:1}
+
+  .chart-bar{display:flex;align-items:flex-end;gap:8px;height:80px;margin-top:8px}
+  .chart-bar span{flex:1;background:linear-gradient(180deg,var(--accent),var(--accent2));border-radius:6px 6px 0 0;min-width:4px}
+
+  .logs{max-height:240px;overflow-y:auto}
+  .logs::-webkit-scrollbar{width:4px}.logs::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+  .log-l{font-family:monospace;font-size:.7rem;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.03)}
+  .log-l.e{color:var(--red)}.log-l.i{color:var(--green)}.log-l.w{color:var(--yellow)}
+
+  @media(max-width:768px){.grid2{grid-template-columns:1fr}#app{padding:16px}}
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="header">
+    <div>
+      <h1>⚡ Qwen Web2API</h1>
+      <div style="font-size:.75rem;color:var(--muted);margin-top:2px">TS Edition · High-Performance Gateway</div>
+    </div>
+    <div class="meta">
+      <span style="font-family:monospace">{{ uptime }}</span>
+      <div class="status-pill">
+        <span class="dot" :class="status.online?'ok':'err'"></span>
+        <span style="font-size:.8rem;font-weight:600">{{ status.online?'在线':'离线' }}</span>
+      </div>
+      <button class="btn btn-warn" @click="relogin" :disabled="reloginning">{{ reloginning?'登录中...':'🔄 凭证登录' }}</button>
+      <button class="btn btn-danger" @click="deleteChats" :disabled="deleting">{{ deleting?'删除中...':'🗑 删除对话' }}</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card" v-for="c in cards" :key="c.key">
+      <div class="icon">{{ c.icon }}</div><div class="label">{{ c.label }}</div>
+      <div class="val" :class="c.cls">{{ c.val }}</div>
+      <div style="font-size:.7rem;color:var(--muted);margin-top:4px">{{ c.sub }}</div>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="label" style="margin-bottom:12px">📡 API 端点</div>
+      <div v-for="ep in endpoints" class="endpoint-row">
+        <span class="method" :class="ep.method">{{ ep.method }}</span>
+        <span class="ep">{{ ep.path }}</span><span class="ep-desc">{{ ep.desc }}</span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="label" style="margin-bottom:12px">📊 响应延迟 (ms)</div>
+      <div class="chart-bar"><span v-for="(h,i) in latencyBars" :key="i" :style="{height:(h*2||4)+'px',opacity:.3+h/100}"></span></div>
+      <div style="display:flex;justify-content:space-between;font-size:.65rem;color:var(--muted);margin-top:6px">
+        <span>min:{{ Math.min(...latencyBars) }}ms</span><span>avg:{{ avg(latencyBars) }}ms</span><span>max:{{ Math.max(...latencyBars) }}ms</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label" style="margin-bottom:10px">📋 Connector 日志</div>
+    <div class="logs"><div class="log-l" :class="l.cls" v-for="(l,i) in logs" :key="i">{{ l.ts }} {{ l.text }}</div></div>
+  </div>
+</div>
+
+<script>
+const {createApp,ref,reactive,computed,onMounted,onUnmounted}=Vue;
+createApp({setup(){
+  const status=reactive({online:false}),uptime=ref('00:00'),reloginning=ref(false),deleting=ref(false);
+  let startTime=Date.now(),timer;
+  const latencyBars=ref(Array.from({length:24},()=>Math.random()*40+5)),logs=ref([]);
+  function addLog(t,c='i'){const ts=new Date().toLocaleTimeString('zh-CN');logs.value.unshift({ts,text:t,cls:c});if(logs.value.length>60)logs.value.pop()}
+  function avg(a){return a.length?Math.round(a.reduce((x,y)=>x+y,0)/a.length):0}
+  const info=reactive({mode:'--',thinking:false,search:false,chrome:false,login:false,conn:0});
+  const endpoints=[{method:'post',path:'/v1/chat/completions',desc:'OpenAI — 流式/非流式，Function Calling'},{method:'post',path:'/v1/messages',desc:'Anthropic — 流式/非流式，Tool Use'},{method:'get',path:'/',desc:'服务状态 JSON'},{method:'get',path:'/dashboard',desc:'仪表盘'}];
+  const cards=computed(()=>[
+    {key:'p',icon:'🔌',label:'端口',val:'0.0.0.0:5419',cls:'b',sub:'Fastify HTTP/1.1'},
+    {key:'m',icon:'🧠',label:'模式',val:(info.mode||'--').toUpperCase(),cls:'c',sub:info.mode==='expert'?'深度推理':'快速响应'},
+    {key:'t',icon:'💭',label:'推理',val:info.thinking?'启用':'禁用',cls:info.thinking?'g':'r',sub:'Thinking Chain'},
+    {key:'s',icon:'🔍',label:'搜索',val:info.search?'启用':'禁用',cls:info.search?'g':'',sub:'联网检索'},
+    {key:'ch',icon:'🌐',label:'Chrome',val:info.chrome?'已连接':'未连接',cls:info.chrome?'g':'r',sub:'CDP 60131'},
+    {key:'li',icon:'🔐',label:'凭证',val:info.login?'正常':'失效',cls:info.login?'g':'r',sub:'JWT Token'},
+    {key:'co',icon:'⚙️',label:'并发',val:'5',cls:'b',sub:'Fail-Fast'},
+    {key:'cn',icon:'📶',label:'连接',val:String(info.conn||0),cls:info.conn>0?'c':'',sub:'实时'}
+  ]);
+
+  async function deleteChats(){
+    deleting.value=true;addLog('🗑 正在删除所有对话...','w');
+    try{const r=await fetch('http://127.0.0.1:5419/delete-chats',{method:'POST'});const d=await r.json();addLog('✓ 已删除 '+d.deleted+'/'+d.total+' 个对话','i')}
+    catch(e){addLog('✗ 删除失败: '+e.message,'e')}finally{deleting.value=false}
+  }
+  async function relogin(){
+    reloginning.value=true;addLog('🔄 后台触发登录 (开 tab，不抢焦点)...','w');
+    try{const r=await fetch('http://127.0.0.1:5419/relogin',{method:'POST'});const d=await r.json();addLog(d.ok?'✓ 登录流程已触发':'✗ '+d.error,'i');setTimeout(fetchAll,10000)}
+    catch(e){addLog('✗ 触发失败: '+e.message,'e')}finally{reloginning.value=false}
+  }
+  async function fetchAll(){
+    try{const t0=Date.now(),r=await fetch('http://127.0.0.1:5419/'),d=await r.json(),ms=Date.now()-t0;
+      latencyBars.value.push(ms);if(latencyBars.value.length>24)latencyBars.value.shift();
+      info.mode=d.mode||'--';info.thinking=d.thinking_enabled??false;info.search=d.search_enabled??false;info.chrome=d.chrome_connected??false;info.login=d.login_ok??false;info.conn=d.connections??0;
+      status.online=true;addLog('✓ 延迟:'+ms+'ms 连接:'+info.conn,'i')
+    }catch(e){status.online=false;addLog('✗ '+e.message,'e')}
+  }
+  onMounted(()=>{fetchAll();timer=setInterval(()=>{fetchAll();const e=Math.floor((Date.now()-startTime)/1000);uptime.value=String(Math.floor(e/60)).padStart(2,'0')+':'+String(e%60).padStart(2,'0')},4000)});
+  onUnmounted(()=>clearInterval(timer));
+  return {status,uptime,cards,info,endpoints,latencyBars,logs,fetchAll,addLog,relogin,deleteChats,reloginning,deleting,avg,Math};
+}}).mount('#app');
+</script>
+</body>
+</html>

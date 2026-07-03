@@ -1,0 +1,150 @@
+name: Build & Release ZIP
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: 打包 ZIP
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          if ($version -match '^v(\d+\.\d+\.\d+)') {
+            $ver = $matches[1]
+          } else {
+            $ver = $version
+          }
+
+          $releaseDir = "release\qwen-web2api"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+
+          # 编译产物
+          Copy-Item -Path "dist\*" -Destination "$releaseDir\" -Recurse
+
+          # node_modules (仅生产依赖)
+          Copy-Item -Path "node_modules" -Destination "$releaseDir\node_modules" -Recurse
+
+          # 配置文件
+          Copy-Item -Path "package.json" -Destination "$releaseDir\"
+          Copy-Item -Path "qwen_auth.example.json" -Destination "$releaseDir\"
+
+          # .env.example
+          @"
+          # Qwen Web2API Server 环境变量配置
+          # 复制此文件为 .env 并填入你的信息
+
+          # 千问登录邮箱（必填）
+          QWEN_EMAIL=your_email@qq.com
+
+          # 千问登录密码（必填）
+          QWEN_PASSWORD=your_password
+
+          # API 鉴权密钥（逗号分隔多个）
+          API_KEYS=sk-deepseek-default-key
+
+          # 监听端口
+          PORT=5419
+
+          # 绑定地址
+          HOST=0.0.0.0
+
+          # 模式: expert / quick（quick 禁用 thinking）
+          MODE=expert
+
+          # 默认启用思考模式
+          THINKING=true
+
+          # 默认启用搜索
+          SEARCH=false
+
+          # 最大并发请求数
+          MAX_CONCURRENT=5
+
+          # 超并发处理: true=直接拒绝, false=排队
+          FAIL_FAST=true
+          "@ | Out-File -FilePath "$releaseDir\.env.example" -Encoding utf8
+
+          # start.bat
+          @"
+          @echo off
+          title Qwen Web2API Server
+          cd /d "%~dp0"
+
+          if not exist ".env" (
+            echo ============================================
+            echo   首次运行 — 正在创建 .env 配置文件...
+            echo ============================================
+            copy .env.example .env > nul
+            echo.
+            echo 已创建 .env 文件，请用记事本编辑：
+            echo   %~dp0.env
+            echo.
+            echo 至少需要填入 QWEN_EMAIL 和 QWEN_PASSWORD
+            echo 编辑完成后重新运行此脚本即可启动服务。
+            echo ============================================
+            start notepad .env
+            pause
+            exit /b
+          )
+
+          echo ============================================
+          echo   Qwen Web2API Server v$ver
+          echo   端口: 5419  仪表盘: http://localhost:5419/dashboard
+          echo ============================================
+          echo.
+
+          node dist\index.js
+
+          pause
+          "@ | Out-File -FilePath "$releaseDir\start.bat" -Encoding Default
+
+          # 打 ZIP
+          $zipName = "qwen-web2api-v$ver.zip"
+          Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipName -Force
+          Write-Host "Created $zipName"
+
+          # 传递变量到下一步
+          "zipName=$zipName" | Out-File -FilePath "$env:GITHUB_ENV" -Encoding utf8 -Append
+          "version=$ver" | Out-File -FilePath "$env:GITHUB_ENV" -Encoding utf8 -Append
+
+      - name: 验证 ZIP
+        shell: pwsh
+        run: |
+          $zipName = "${{ env.zipName }}"
+          if (Test-Path $zipName) {
+            $size = (Get-Item $zipName).Length
+            Write-Host "ZIP: $zipName ($([math]::Round($size / 1MB, 2)) MB)"
+            # 验证内容
+            $entries = [System.IO.Compression.ZipFile]::OpenRead($zipName).Entries
+            $count = $entries.Count
+            Write-Host "Files: $count"
+            $entries.Dispose()
+          } else {
+            Write-Error "ZIP not found!"
+            exit 1
+          }
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: qwen-web2api-*.zip
+          generate_release_notes: true
+          name: "v${{ env.version }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

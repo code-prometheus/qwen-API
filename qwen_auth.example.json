@@ -1,0 +1,7 @@
+{
+  "access_token": "请填入从浏览器获取的 Bearer token（不含 'Bearer ' 前缀）",
+  "cookies": {
+    "example_cookie_name": "请填入从浏览器获取的 cookies"
+  },
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+}

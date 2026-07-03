@@ -1,0 +1,26 @@
+node_modules/
+dist/
+*.log
+
+# 认证凭据
+qwen_auth.json
+.env
+
+# 测试报告
+*_report.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Chrome 用户数据 (本地)
+chrome-profile/
+
+# 日志
+logs/
+
+# 系统
+Thumbs.db
+.DS_Store

@@ -1,0 +1,40 @@
+{
+  "name": "qwen-web2api",
+  "version": "2.0.0",
+  "description": "Qwen Web2API Server — 千问网页版 → OpenAI/Anthropic 标准协议网关",
+  "main": "dist/index.js",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/code-prometheus/qwen-API.git"
+  },
+  "bugs": {
+    "url": "https://github.com/code-prometheus/qwen-API/issues"
+  },
+  "homepage": "https://github.com/code-prometheus/qwen-API#readme",
+  "keywords": ["qwen", "openai", "anthropic", "api", "gateway", "web2api"],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.1.0",
+    "@types/uuid": "^10.0.0",
+    "chrome-launcher": "^1.2.1",
+    "chrome-remote-interface": "^0.34.0",
+    "fastify": "^5.8.5",
+    "pino": "^9.14.0",
+    "pino-pretty": "^11.3.0",
+    "playwright": "^1.61.1",
+    "undici": "^6.27.0",
+    "uuid": "^14.0.1"
+  },
+  "devDependencies": {
+    "@types/chrome-remote-interface": "^0.34.0",
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
