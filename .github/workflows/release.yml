@@ -22,6 +22,7 @@ jobs:
       - run: npm run build
 
       - name: 打包 ZIP
+        id: package
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}"
@@ -119,8 +120,8 @@ jobs:
           Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipName -Force
           Write-Host "Created $zipName"
 
-          # 传递版本号到下一步
-          "version=$ver" | Out-File -FilePath "$env:GITHUB_ENV" -Encoding utf8 -Append
+          # 设置 step 输出，供后续 steps 使用
+          echo "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: 验证 ZIP
         shell: pwsh
@@ -145,6 +146,6 @@ jobs:
         with:
           files: qwen-web2api-*.zip
           generate_release_notes: true
-          name: "v${{ env.version }}"
+          name: "v${{ steps.package.outputs.version }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
