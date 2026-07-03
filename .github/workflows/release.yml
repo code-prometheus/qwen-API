@@ -146,6 +146,6 @@ jobs:
         with:
           files: qwen-web2api-*.zip
           generate_release_notes: true
-          name: "v${{ steps.package.outputs.version }}"
+          name: ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
