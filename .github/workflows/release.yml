@@ -23,6 +23,8 @@ jobs:
 
       - run: npm ci
       - run: npm run build
+      # tsc 不会复制 .html, 先复制到 dist/ 再一起打包（避免单独复制失败）
+      - run: Copy-Item -Path "src\dashboard.html" -Destination "dist\" -Force
 
       - name: 打包 ZIP
         id: package
@@ -38,8 +40,8 @@ jobs:
           $releaseDir = "release\qwen-web2api"
           New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 
-          # 编译产物
-          Copy-Item -Path "dist\*" -Destination "$releaseDir\" -Recurse
+          # 编译产物 (dist/ → ZIP根目录, 已包含 dashboard.html)
+          Copy-Item -Path "dist\*" -Destination "$releaseDir\"
 
           # node_modules (仅生产依赖)
           Copy-Item -Path "node_modules" -Destination "$releaseDir\node_modules" -Recurse
@@ -113,7 +115,7 @@ jobs:
           echo ============================================
           echo.
 
-          node dist\index.js
+          node index.js
 
           pause
           "@ | Out-File -FilePath "$releaseDir\start.bat" -Encoding Default
