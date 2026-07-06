@@ -2,14 +2,15 @@
  * Qwen Web2API Server — TS 版入口
  *
  * 启动流程:
- * 1. 检测/启动 Chrome @ 60131
- * 2. 第一时间：最大化窗口、打开仪表盘、关掉其他 tab
- * 3. 检查凭证可用性
- * 4. 启动 Fastify API 服务
+ * 1. 检测 60131 端口 → 已有已登录 Chrome 则复用
+ * 2. 无 → Playwright launchPersistentContext 启动 Chrome → 自动登录 → 保存 session
+ *     → 关掉 Playwright context（不关 Chrome，保持 60131 占用）
+ * 3. 在用户默认浏览器打开仪表盘（不占用 Chrome 60131 的窗口）
  *
  * 永不主动退出。凭证失效时用户点击仪表盘按钮手动触发登录。
  */
 
+import { exec } from "node:child_process";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { config } from "./config.js";
@@ -22,51 +23,42 @@ import { loginAuto, loginWithCredentials, deleteAllChats, hasLocalCredentials } 
 setupLogging();
 const log = getLogger();
 
-// ─── Chrome：启动/连接，最大化 + 仪表盘 ────────────────────
+// ─── Chrome：检测 60131 → 无则登录 → 默认浏览器开仪表盘 ────
 
 let chrome: ChromeManager | null = null;
 let loginSuccess = hasLocalCredentials();
+
+/** 在默认浏览器中打开仪表盘 */
+function openDashboardInDefaultBrowser(port: number): void {
+  const url = `http://127.0.0.1:${port}/dashboard`;
+  const platform = process.platform;
+  const cmd =
+    platform === "win32"
+      ? `start "" "${url}"`
+      : platform === "darwin"
+        ? `open "${url}"`
+        : `xdg-open "${url}"`;
+  exec(cmd, (err) => {
+    if (err) log.warn("[Bootstrap] 默认浏览器打开仪表盘失败: " + err.message);
+    else log.info("[Bootstrap] 仪表盘已在默认浏览器打开: " + url);
+  });
+}
 
 try {
   chrome = new ChromeManager();
   await chrome.initialize();
   log.info("[Bootstrap] Chrome CDP 已连接");
 
-  // 第一时间：最大化 + 开仪表盘 + 关其他 tab
-  const { chromium } = await import("playwright");
-  const browser = await chromium.connectOverCDP("http://127.0.0.1:60131");
-  const ctx = browser.contexts()[0];
-  const pages = ctx.pages();
-
-  // 最大化
-  if (pages.length > 0) {
-    const cdp = await ctx.newCDPSession(pages[0]);
-    await cdp.send("Browser.setWindowBounds", { windowId: 1, bounds: { windowState: "maximized" } }).catch(() => {});
+  // 如果 Chrome 是本次新启动的（之前没有登录 session），执行登录
+  if (!loginSuccess) {
+    log.info("[Bootstrap] 无本地凭证，自动登录...");
+    loginSuccess = await loginAuto();
   }
 
-  // 关掉所有现有 tab
-  for (const p of pages) {
-    const u = (await p.evaluate("location.href").catch(() => "")) as string;
-    if (!u.includes("dashboard")) await p.close();
-  }
-
-  // 等待 Tab 能力就绪（重试 newPage）
-  let dash: any = null;
-  for (let i = 0; i < 5; i++) {
-    try {
-      dash = await ctx.newPage();
-      break;
-    } catch { await new Promise(r => setTimeout(r, 1000)); }
-  }
-  if (dash) {
-    await dash.goto(`http://127.0.0.1:${config.port}/dashboard`, { waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
-    await dash.bringToFront();
-    log.info("[Bootstrap] 仪表盘已打开，窗口已最大化");
-  }
-
-  await browser.close(); // 只断开 Playwright，不关 Chrome
+  // 在默认浏览器打开仪表盘（不抢占 Chrome 60131 的窗口）
+  openDashboardInDefaultBrowser(config.port);
 } catch (err: any) {
-  log.warn("[Bootstrap] Chrome 仪表盘初始化失败: " + err.message);
+  log.warn("[Bootstrap] Chrome 初始化失败: " + err.message);
 }
 
 // ─── Fastify ───────────────────────────────────────────────

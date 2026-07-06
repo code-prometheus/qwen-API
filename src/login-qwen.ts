@@ -75,40 +75,18 @@ export async function loginWithCredentials(
 ): Promise<boolean> {
   const log = getLogger();
   const { chromium } = await import("playwright");
-  const profilePath = resolve(__dirname, "..", "chrome-profile");
+  const { ChromeManager } = await import("./chrome-manager.js");
 
-  let context;
+  let browser: any = null;
   try {
-    // 先检查 60131 是否有 Chrome，有则复用它
-    const cdpEndpoint = "http://127.0.0.1:60131";
-    const { default: net } = await import("node:net");
-    const portOpen = await new Promise<boolean>((resolve) => {
-      const s = net.createConnection({ port: 60131, host: "127.0.0.1" });
-      s.on("connect", () => { s.end(); resolve(true); });
-      s.on("error", () => resolve(false));
-    });
+    // 确保 Chrome 在 60131 运行（没有则 spawn 启动）
+    const cm = new ChromeManager();
+    await cm.initialize();
 
-    if (portOpen) {
-      log.info("[Login] 复用已有 Chrome (CDP connect)");
-      const browser = await chromium.connectOverCDP(cdpEndpoint);
-      context = browser.contexts()[0];
-    } else {
-      log.info("[Login] 启动 Playwright Chrome...");
-      context = await chromium.launchPersistentContext(profilePath, {
-      channel: "chrome",
-      headless: false,
-      args: [
-        "--remote-debugging-port=60131",
-        "--no-first-run",
-        "--no-proxy-server",
-        "--disable-extensions",
-        "--disable-sync",
-        "--disable-features=ChromePasswordManager,CredentialManagementUIShell",
-      ],
-      viewport: { width: 1280, height: 800 },
-    });
-    }
-
+    // 始终通过 CDP 连接（connectOverCDP 的 close() 不关 Chrome）
+    log.info("[Login] 连接 Chrome CDP...");
+    browser = await chromium.connectOverCDP("http://127.0.0.1:60131");
+    const context = browser.contexts()[0];
     const page = context.pages()[0] || await context.newPage();
 
     // 1. 导航到 /auth（弹窗在这里出现，抢走焦点）
@@ -137,7 +115,7 @@ export async function loginWithCredentials(
 
     if (!token) {
       log.error("[Login] 未获取到 token");
-      await context.close();
+      await browser.close();
       return false;
     }
 
@@ -152,7 +130,7 @@ export async function loginWithCredentials(
     saveToken(token, cookieDict, ua);
     log.info(`[Login] 登录完成 (token=${token.length}字符, cookies=${Object.keys(cookieDict).length})`);
 
-    // 关掉千问 tab（不抢仪表盘焦点）
+    // 关掉千问 tab
     try {
       const pages = context.pages();
       for (const p of pages) {
@@ -164,9 +142,12 @@ export async function loginWithCredentials(
       log.info("[Login] 千问 tab 已关闭");
     } catch {}
 
+    // 断开 Playwright CDP（不关 Chrome）
+    await browser.close();
     return true;
   } catch (err: any) {
     log.error({ err }, "[Login] 登录异常");
+    await browser?.close().catch(() => {});
     return false;
   }
 }
