@@ -82,15 +82,24 @@ let activeConnections = 0;
 app.addHook("onRequest", async () => { activeConnections++; });
 app.addHook("onResponse", async () => { activeConnections--; });
 
-// 仪表盘 HTML（优先从文件读，exe 模式下用 bundle 内联版本）
+// 仪表盘 HTML — 从多个路径查找（开发 dist/、源码 src/、ZIP 根目录）
 app.get("/dashboard", async (_req, reply) => {
   let html = "";
   try {
-    const { readFileSync } = await import("node:fs");
+    const { readFileSync, existsSync } = await import("node:fs");
     const { resolve, dirname } = await import("node:path");
     const { fileURLToPath } = await import("node:url");
-    html = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "dashboard.html"), "utf-8");
-  } catch {
+    const __dirname = dirname(fileURLToPath(import.meta.url));
+    const searchPaths = [
+      resolve(process.cwd(), "dashboard.html"),
+      resolve(__dirname, "dashboard.html"),
+      resolve(__dirname, "..", "src", "dashboard.html"),
+    ];
+    for (const p of searchPaths) {
+      if (existsSync(p)) { html = readFileSync(p, "utf-8"); break; }
+    }
+  } catch {}
+  if (!html) {
     try {
       const m = await (new Function("return import('./dashboard_html.mjs')")()) as any;
       html = m.DASHBOARD_HTML;
