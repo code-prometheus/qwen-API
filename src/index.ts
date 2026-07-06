@@ -2,15 +2,15 @@
  * Qwen Web2API Server — TS 版入口
  *
  * 启动流程:
- * 1. 检测 60131 端口 → 已有已登录 Chrome 则复用
- * 2. 无 → Playwright launchPersistentContext 启动 Chrome → 自动登录 → 保存 session
- *     → 关掉 Playwright context（不关 Chrome，保持 60131 占用）
- * 3. 在用户默认浏览器打开仪表盘（不占用 Chrome 60131 的窗口）
+ * 1. 无本地凭证 → Playwright launchPersistentContext 登录 → 保存 → 关闭临时 Chrome
+ * 2. ChromeManager spawn 后台 Chrome @ 60131（复用 chrome-profile session）
+ * 3. 智能打开仪表盘：优先在已运行浏览器中新 tab，否则新开默认浏览器
+ * 4. 启动 Fastify API 服务
  *
  * 永不主动退出。凭证失效时用户点击仪表盘按钮手动触发登录。
  */
 
-import { exec } from "node:child_process";
+import { exec, execSync } from "node:child_process";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { config } from "./config.js";
@@ -23,15 +23,62 @@ import { loginAuto, loginWithCredentials, deleteAllChats, hasLocalCredentials } 
 setupLogging();
 const log = getLogger();
 
-// ─── Chrome：检测 60131 → 无则登录 → 默认浏览器开仪表盘 ────
+// ─── 智能仪表盘打开 ──────────────────────────────────────────
 
-let chrome: ChromeManager | null = null;
-let loginSuccess = hasLocalCredentials();
-
-/** 在默认浏览器中打开仪表盘 */
-function openDashboardInDefaultBrowser(port: number): void {
+/**
+ * 尝试在已运行的 Chrome/Edge 浏览器中打开新 tab。
+ * 找不到已有浏览器时回退到 start（默认浏览器）。
+ */
+function openDashboardSmart(port: number): void {
   const url = `http://127.0.0.1:${port}/dashboard`;
   const platform = process.platform;
+
+  if (platform === "win32") {
+    // 查找 Chrome 窗口标题（通过 tasklist），有则用 start 打开 tab
+    // start 命令对已运行的 Chrome 会自动在新 tab 打开 URL
+    try {
+      const tasklist = execSync(
+        'tasklist /fi "IMAGENAME eq chrome.exe" /fo csv /nh 2>nul',
+        { shell: "cmd.exe", timeout: 5000 }
+      ).toString().trim();
+
+      if (tasklist && tasklist.length > 0) {
+        log.info("[Bootstrap] 检测到 Chrome 进程，在新 tab 打开仪表盘");
+        exec(`start "" "${url}"`);
+        return;
+      }
+    } catch {}
+
+    // 也尝试 Edge
+    try {
+      const tasklist = execSync(
+        'tasklist /fi "IMAGENAME eq msedge.exe" /fo csv /nh 2>nul',
+        { shell: "cmd.exe", timeout: 5000 }
+      ).toString().trim();
+
+      if (tasklist && tasklist.length > 0) {
+        log.info("[Bootstrap] 检测到 Edge 进程，在新 tab 打开仪表盘");
+        exec(`start msedge "${url}"`);
+        return;
+      }
+    } catch {}
+  }
+
+  // macOS 尝试 osascript 在已有 Chrome 开 tab
+  if ((platform as string) === "darwin") {
+    exec(
+      `osascript -e 'tell application "Google Chrome" to open location "${url}"' -e 'activate'`,
+      (err) => {
+        if (err) {
+          // Chrome 没在运行，用 open 默认浏览器
+          exec(`open "${url}"`);
+        }
+      }
+    );
+    return;
+  }
+
+  // 兜底：默认浏览器
   const cmd =
     platform === "win32"
       ? `start "" "${url}"`
@@ -39,27 +86,33 @@ function openDashboardInDefaultBrowser(port: number): void {
         ? `open "${url}"`
         : `xdg-open "${url}"`;
   exec(cmd, (err) => {
-    if (err) log.warn("[Bootstrap] 默认浏览器打开仪表盘失败: " + err.message);
-    else log.info("[Bootstrap] 仪表盘已在默认浏览器打开: " + url);
+    if (err) log.warn("[Bootstrap] 打开仪表盘失败: " + err.message);
   });
+  log.info("[Bootstrap] 仪表盘打开中: " + url);
 }
 
+// ─── 启动：登录 → spawn Chrome → 仪表盘 → Fastify ───────────
+
+let chrome: ChromeManager | null = null;
+let loginSuccess = hasLocalCredentials();
+
+// 步骤 1: 无凭证则登录（Playwright 临时 Chrome → 登录完就关）
+if (!loginSuccess) {
+  log.info("[Bootstrap] 无本地凭证，启动临时 Chrome 登录...");
+  loginSuccess = await loginAuto();
+}
+
+// 步骤 2: spawn 后台 Chrome（复用 chrome-profile 中的 session）
 try {
   chrome = new ChromeManager();
   await chrome.initialize();
-  log.info("[Bootstrap] Chrome CDP 已连接");
-
-  // 如果 Chrome 是本次新启动的（之前没有登录 session），执行登录
-  if (!loginSuccess) {
-    log.info("[Bootstrap] 无本地凭证，自动登录...");
-    loginSuccess = await loginAuto();
-  }
-
-  // 在默认浏览器打开仪表盘（不抢占 Chrome 60131 的窗口）
-  openDashboardInDefaultBrowser(config.port);
+  log.info("[Bootstrap] 后台 Chrome 就绪 (60131)");
 } catch (err: any) {
-  log.warn("[Bootstrap] Chrome 初始化失败: " + err.message);
+  log.warn("[Bootstrap] 后台 Chrome 启动失败: " + err.message);
 }
+
+// 步骤 3: 智能打开仪表盘
+openDashboardSmart(config.port);
 
 // ─── Fastify ───────────────────────────────────────────────
 
@@ -135,7 +188,7 @@ app.get("/health", async () => {
   };
 });
 
-// 手动触发登录（仪表盘按钮 → 开 tab 登录，不抢焦点）
+// 手动触发登录（仪表盘按钮）
 app.post("/relogin", async (_req, reply) => {
   log.info("[API] 手动触发登录...");
   const email = process.env.QWEN_EMAIL || process.env.EMAIL;

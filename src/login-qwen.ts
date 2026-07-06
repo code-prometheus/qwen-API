@@ -4,6 +4,13 @@
  * 千问 /auth 页面会弹出一个浏览器原生弹窗（抢焦点），
  * Playwright 的 page.keyboard 操作直接作用于该弹窗，
  * Tab 切换 input → type 输入 → Enter 提交。
+ *
+ * 登录流程:
+ * 1. launchPersistentContext 启动临时 Playwright Chrome (60131)
+ * 2. 键盘操作弹窗登录
+ * 3. 提取 token + cookies → 保存 qwen_auth.json
+ * 4. context.close() 关闭这个临时 Chrome
+ * 5. 后续 chrome-manager spawn 后台 Chrome 复用 profile 中的 session
  */
 
 import { writeFileSync, existsSync, readFileSync } from "node:fs";
@@ -24,7 +31,6 @@ export interface QwenAuthData {
 export async function deleteAllChats(page: any, log: any): Promise<{ deleted: number; total: number }> {
   try {
     log.info("[Cleanup] 删除所有历史对话...");
-    // 获取对话列表
     const listResp = await page.evaluate(async () => {
       const resp = await fetch("https://chat.qwen.ai/api/v2/chats?page=1&page_size=100", {
         credentials: "include",
@@ -34,7 +40,6 @@ export async function deleteAllChats(page: any, log: any): Promise<{ deleted: nu
     const chats = JSON.parse(listResp).data || [];
     log.info(`[Cleanup] 共 ${chats.length} 个对话`);
 
-    // 逐个删除
     let deleted = 0;
     for (const chat of chats) {
       const result = await page.evaluate(async (id: string) => {
@@ -46,7 +51,6 @@ export async function deleteAllChats(page: any, log: any): Promise<{ deleted: nu
         return JSON.stringify({ status: resp.status, success: body?.success });
       }, chat.id);
       if (JSON.parse(result).success) deleted++;
-      // 间隔 100ms 防止触发限流
       await new Promise(r => setTimeout(r, 100));
     }
     log.info(`[Cleanup] 已删除 ${deleted}/${chats.length} 个对话`);
@@ -69,24 +73,36 @@ function saveToken(token: string, cookies: Record<string, string>, userAgent: st
   getLogger().info(`凭证已保存 (token_len=${token.length}, cookies=${Object.keys(cookies).length})`);
 }
 
+/**
+ * 用 Playwright launchPersistentContext 做登录。
+ * 登录完成后 context.close() 关闭这个临时 Chrome，
+ * 然后由 chrome-manager spawn 后台 Chrome 复用 profile session。
+ */
 export async function loginWithCredentials(
   email: string,
   password: string
 ): Promise<boolean> {
   const log = getLogger();
   const { chromium } = await import("playwright");
-  const { ChromeManager } = await import("./chrome-manager.js");
+  const profilePath = resolve(__dirname, "..", "chrome-profile");
 
-  let browser: any = null;
+  let context: any = null;
   try {
-    // 确保 Chrome 在 60131 运行（没有则 spawn 启动）
-    const cm = new ChromeManager();
-    await cm.initialize();
+    log.info("[Login] 启动临时 Playwright Chrome 用于登录...");
+    context = await chromium.launchPersistentContext(profilePath, {
+      channel: "chrome",
+      headless: false,
+      args: [
+        "--remote-debugging-port=60131",
+        "--no-first-run",
+        "--no-proxy-server",
+        "--disable-extensions",
+        "--disable-sync",
+        "--disable-features=ChromePasswordManager,CredentialManagementUIShell",
+      ],
+      viewport: { width: 1280, height: 800 },
+    });
 
-    // 始终通过 CDP 连接（connectOverCDP 的 close() 不关 Chrome）
-    log.info("[Login] 连接 Chrome CDP...");
-    browser = await chromium.connectOverCDP("http://127.0.0.1:60131");
-    const context = browser.contexts()[0];
     const page = context.pages()[0] || await context.newPage();
 
     // 1. 导航到 /auth（弹窗在这里出现，抢走焦点）
@@ -115,7 +131,7 @@ export async function loginWithCredentials(
 
     if (!token) {
       log.error("[Login] 未获取到 token");
-      await browser.close();
+      await context.close();
       return false;
     }
 
@@ -130,24 +146,17 @@ export async function loginWithCredentials(
     saveToken(token, cookieDict, ua);
     log.info(`[Login] 登录完成 (token=${token.length}字符, cookies=${Object.keys(cookieDict).length})`);
 
-    // 关掉千问 tab
-    try {
-      const pages = context.pages();
-      for (const p of pages) {
-        const u = (await p.evaluate("location.href").catch(() => "")) as string;
-        if (u.includes("qwen.ai") || u.includes("auth")) {
-          await p.close();
-        }
-      }
-      log.info("[Login] 千问 tab 已关闭");
-    } catch {}
+    // 6. 关闭临时 Chrome（session 已保存到 chrome-profile，后续 spawn 会复用）
+    log.info("[Login] 关闭临时 Chrome...");
+    await context.close();
+    // 短暂等待 Chrome 完全退出释放 profile 锁
+    await new Promise(r => setTimeout(r, 2000));
 
-    // 断开 Playwright CDP（不关 Chrome）
-    await browser.close();
     return true;
   } catch (err: any) {
     log.error({ err }, "[Login] 登录异常");
-    await browser?.close().catch(() => {});
+    try { await context?.close(); } catch {}
+    await new Promise(r => setTimeout(r, 2000));
     return false;
   }
 }
