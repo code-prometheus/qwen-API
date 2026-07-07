@@ -14,11 +14,12 @@
  *     → yield {type, content} 块
  */
 
-import { v4 as uuidv4 } from "uuid"; // 注意: 需要安装 @types/uuid uuid
+import { v4 as uuidv4 } from "uuid";
 import { getLogger } from "./logger.js";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { cdpFetch } from "./cdp-proxy.js";
 
 // ─── 类型 ──────────────────────────────────────────────────
 
@@ -218,7 +219,8 @@ export class QwenAI {
     headers.Cookie = this.buildCookieHeader();
     headers["X-Request-Id"] = genId();
 
-    for (let attempt = 0; attempt < 5; attempt++) {
+    // Phase 1: 直连 fetch (最多 2 次)
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const resp = await fetch(API_CHAT_NEW, {
           method: "POST",
@@ -232,26 +234,27 @@ export class QwenAI {
           if (data.success) return data.data.id;
         }
 
-        // WAF 检测
         const isWaf = resp.headers.get("bxpunish") || ct.includes("html");
         if (isWaf) {
-          getLogger().warn({ attempt, url: API_CHAT_NEW }, "[_createChat] WAF 拦截");
-          if (attempt < 4) {
-            await new Promise((r) => setTimeout(r, 5000 * (attempt + 1)));
-            await refreshAcwTc();
-            headers.Cookie = this.buildCookieHeader();
-            continue;
-          }
+          getLogger().warn({ attempt }, "[createChat] WAF — falling back to CDP");
+          break; // 跳出 fetch 循环，走 CDP
         }
       } catch (err) {
-        getLogger().warn({ err, attempt }, "创建对话失败");
-        if (attempt < 4) await new Promise((r) => setTimeout(r, 3000));
+        getLogger().warn({ err, attempt }, "[createChat] fetch error");
+        break;
       }
     }
 
-    // 所有重试已耗尽，抛出错误让上层处理（而非静默返回假 chat_id）
+    // Phase 2: CDP proxy
+    getLogger().info("[createChat] CDP proxy...");
+    const cdpResult = await cdpFetch(API_CHAT_NEW, payload);
+    if (cdpResult.ok && cdpResult.data?.success) {
+      getLogger().info("[createChat] CDP proxy OK");
+      return cdpResult.data.data.id;
+    }
+
     throw new Error(
-      "创建对话失败：5 次重试后仍无法获得有效 chat_id。" +
+      "创建对话失败: fetch + CDP 均失败。" +
       "请检查凭证是否有效、网络是否可达、或千问 API 是否变更。"
     );
   }
@@ -354,10 +357,11 @@ export class QwenAI {
     const url = `${API_COMPLETION}?chat_id=${chatId}`;
 
     let chunkCount = 0;
-    this.wafRetries = 0;
-    let lastThinkingLen = 0; // 用长度追踪增量而非全等比较
+    let lastThinkingLen = 0;
+    let fetchOk = false;
 
-    while (this.wafRetries < this.MAX_WAF_RETRIES) {
+    // Phase 1: fetch SSE (最多 2 次)
+    for (let attempt = 0; attempt < 2 && !fetchOk; attempt++) {
       try {
         const resp = await fetch(url, {
           method: "POST",
@@ -365,42 +369,19 @@ export class QwenAI {
           body: JSON.stringify(payload),
         });
 
-        // WAF 检测
         const ct = resp.headers.get("content-type") || "";
         const bxpunish = resp.headers.get("bxpunish") || "";
-        const status = resp.status;
 
-        const isWaf = this.detectWaf(resp, ct, bxpunish, status);
-
-        if (isWaf) {
-          this.wafRetries++;
-          getLogger().warn(
-            { wafRetry: this.wafRetries, url, model: qwenModel, status, contentType: ct },
-            "[!] WAF 拦截 completions"
-          );
-
-          if (this.wafRetries >= this.MAX_WAF_RETRIES) {
-            yield {
-              type: "error",
-              content: `WAF 拦截，重试次数已用完。将尝试浏览器自动登录刷新凭证...`,
-            };
-            return;
-          }
-
-          // 重试前刷新 acw_tc
-          await refreshAcwTc();
-          headers.Cookie = this.buildCookieHeader();
-          headers["X-Request-Id"] = genId();
-          await new Promise((r) => setTimeout(r, 8000 * Math.pow(this.wafRetries, 1.5)));
-          continue;
+        if (bxpunish || (ct.includes("html") && resp.status === 200)) {
+          getLogger().warn({ attempt }, "[chatStream] WAF (fetch)");
+          break; // 切 CDP
         }
 
-        if (status !== 200) {
-          yield { type: "error", content: `HTTP ${status}` };
+        if (resp.status !== 200) {
+          yield { type: "error", content: `HTTP ${resp.status}` };
           return;
         }
 
-        // 解析 SSE 流
         if (!resp.body) {
           yield { type: "error", content: "响应体为空" };
           return;
@@ -416,7 +397,7 @@ export class QwenAI {
 
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split("\n");
-          buffer = lines.pop() || ""; // 保留未完成的行
+          buffer = lines.pop() || "";
 
           for (const line of lines) {
             const trimmed = line.trim();
@@ -430,9 +411,8 @@ export class QwenAI {
               if (parsed.type === "thinking") {
                 const current = parsed.content || "";
                 if (current.length > lastThinkingLen) {
-                  const newPart = current.slice(lastThinkingLen);
+                  yield { type: "thinking", content: current.slice(lastThinkingLen) };
                   lastThinkingLen = current.length;
-                  if (newPart) yield { type: "thinking", content: newPart };
                 }
               } else {
                 yield { type: "text", content: parsed.content || "" };
@@ -441,23 +421,40 @@ export class QwenAI {
           }
         }
 
-        // 成功解析完毕
-        break;
+        fetchOk = true;
       } catch (err: any) {
-        getLogger().warn({ err }, "流式请求异常");
-        this.wafRetries++;
-        if (this.wafRetries < 3) {
-          await new Promise((r) => setTimeout(r, 5000 * this.wafRetries));
-          continue;
-        }
-        yield { type: "error", content: err?.message || String(err) };
-        return;
+        getLogger().warn({ err }, "[chatStream] fetch error");
+        break;
       }
     }
 
-    if (chunkCount === 0) {
-      yield { type: "text", content: "" };
+    if (fetchOk) {
+      if (chunkCount === 0) yield { type: "text", content: "" };
+      return;
     }
+
+    // Phase 2: CDP proxy (non-streaming)
+    getLogger().info("[chatStream] CDP proxy (non-streaming)...");
+    const nonStreamPayload = { ...payload, stream: false };
+    const cdpResult = await cdpFetch(url, nonStreamPayload);
+    if (cdpResult.ok && cdpResult.data?.choices?.length) {
+      const msg = cdpResult.data.choices[0].message || cdpResult.data.choices[0].delta || {};
+      if (msg.reasoning_content) {
+        yield { type: "thinking", content: msg.reasoning_content as string };
+      }
+      if (msg.content) {
+        yield { type: "text", content: msg.content as string };
+      }
+      if (!msg.reasoning_content && !msg.content) {
+        yield { type: "text", content: "" };
+      }
+      return;
+    }
+
+    yield {
+      type: "error",
+      content: "请求失败: fetch + CDP 均无法完成。请检查凭证或网络。",
+    };
   }
 
   /**
