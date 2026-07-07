@@ -218,7 +218,8 @@ export class QwenAI {
     headers.Cookie = this.buildCookieHeader();
     headers["X-Request-Id"] = genId();
 
-    for (let attempt = 0; attempt < 5; attempt++) {
+    // Phase 1: 直连 fetch (最多 2 次)
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const resp = await fetch(API_CHAT_NEW, {
           method: "POST",
@@ -232,27 +233,63 @@ export class QwenAI {
           if (data.success) return data.data.id;
         }
 
-        // WAF 检测
         const isWaf = resp.headers.get("bxpunish") || ct.includes("html");
         if (isWaf) {
-          getLogger().warn({ attempt, url: API_CHAT_NEW }, "[_createChat] WAF 拦截");
-          if (attempt < 4) {
-            await new Promise((r) => setTimeout(r, 5000 * (attempt + 1)));
+          getLogger().warn({ attempt }, "[createChat] WAF (fetch), retry...");
+          if (attempt < 1) {
+            await new Promise((r) => setTimeout(r, 3000));
             await refreshAcwTc();
             headers.Cookie = this.buildCookieHeader();
             continue;
           }
         }
       } catch (err) {
-        getLogger().warn({ err, attempt }, "创建对话失败");
-        if (attempt < 4) await new Promise((r) => setTimeout(r, 3000));
+        getLogger().warn({ err, attempt }, "[createChat] fetch failed");
       }
     }
 
-    // 所有重试已耗尽，抛出错误让上层处理（而非静默返回假 chat_id）
+    // Phase 2: CDP proxy via Chrome (real browser TLS fingerprint)
+    try {
+      getLogger().info("[createChat] switching to CDP proxy...");
+      const { chromium } = await import("playwright");
+      const browser = await chromium.connectOverCDP("http://127.0.0.1:60131");
+      const context = browser.contexts()[0];
+      const page = context.pages()[0] || await context.newPage();
+
+      await page.goto("https://chat.qwen.ai", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+      await new Promise(r => setTimeout(r, 1000));
+
+      const result = await page.evaluate(async ({ url, payload, headers }: {
+        url: string; payload: any; headers: Record<string, string>;
+      }) => {
+        try {
+          const resp = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(payload),
+            credentials: "include",
+          });
+          const data = await resp.json();
+          return JSON.stringify({ ok: resp.ok, status: resp.status, data });
+        } catch (e: any) {
+          return JSON.stringify({ ok: false, error: e.message });
+        }
+      }, { url: API_CHAT_NEW, payload, headers });
+
+      await browser.close().catch(() => {});
+      const parsed = JSON.parse(result);
+      if (parsed.ok && parsed.data?.success) {
+        getLogger().info("[createChat] CDP proxy OK");
+        return parsed.data.data.id;
+      }
+      getLogger().warn({ result: parsed }, "[createChat] CDP proxy failed");
+    } catch (cdpErr: any) {
+      getLogger().warn({ err: cdpErr }, "[createChat] CDP proxy error");
+    }
+
     throw new Error(
-      "创建对话失败：5 次重试后仍无法获得有效 chat_id。" +
-      "请检查凭证是否有效、网络是否可达、或千问 API 是否变更。"
+      "createChat failed: fetch+CDP all exhausted. " +
+      "Check credentials, network, or Qwen API changes."
     );
   }
 
@@ -355,8 +392,9 @@ export class QwenAI {
 
     let chunkCount = 0;
     this.wafRetries = 0;
-    let lastThinkingLen = 0; // 用长度追踪增量而非全等比较
+    let lastThinkingLen = 0;
 
+    // Phase 1: fetch SSE (retry on WAF)
     while (this.wafRetries < this.MAX_WAF_RETRIES) {
       try {
         const resp = await fetch(url, {
@@ -365,7 +403,6 @@ export class QwenAI {
           body: JSON.stringify(payload),
         });
 
-        // WAF 检测
         const ct = resp.headers.get("content-type") || "";
         const bxpunish = resp.headers.get("bxpunish") || "";
         const status = resp.status;
@@ -376,18 +413,14 @@ export class QwenAI {
           this.wafRetries++;
           getLogger().warn(
             { wafRetry: this.wafRetries, url, model: qwenModel, status, contentType: ct },
-            "[!] WAF 拦截 completions"
+            "[!] WAF intercept completions (fetch)"
           );
 
           if (this.wafRetries >= this.MAX_WAF_RETRIES) {
-            yield {
-              type: "error",
-              content: `WAF 拦截，重试次数已用完。将尝试浏览器自动登录刷新凭证...`,
-            };
-            return;
+            // Fall through to CDP proxy instead of giving up
+            break;
           }
 
-          // 重试前刷新 acw_tc
           await refreshAcwTc();
           headers.Cookie = this.buildCookieHeader();
           headers["X-Request-Id"] = genId();
@@ -400,7 +433,6 @@ export class QwenAI {
           return;
         }
 
-        // 解析 SSE 流
         if (!resp.body) {
           yield { type: "error", content: "响应体为空" };
           return;
@@ -416,7 +448,7 @@ export class QwenAI {
 
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split("\n");
-          buffer = lines.pop() || ""; // 保留未完成的行
+          buffer = lines.pop() || "";
 
           for (const line of lines) {
             const trimmed = line.trim();
@@ -441,22 +473,67 @@ export class QwenAI {
           }
         }
 
-        // 成功解析完毕
-        break;
+        // fetch SSE success
+        if (chunkCount === 0) yield { type: "text", content: "" };
+        return;
       } catch (err: any) {
-        getLogger().warn({ err }, "流式请求异常");
+        getLogger().warn({ err }, "[chatStream] fetch SSE error");
         this.wafRetries++;
-        if (this.wafRetries < 3) {
+        if (this.wafRetries < this.MAX_WAF_RETRIES) {
           await new Promise((r) => setTimeout(r, 5000 * this.wafRetries));
           continue;
         }
-        yield { type: "error", content: err?.message || String(err) };
-        return;
+        // Fall through to CDP
+        break;
       }
     }
 
-    if (chunkCount === 0) {
-      yield { type: "text", content: "" };
+    // Phase 2: CDP proxy — non-streaming fallback via real browser
+    try {
+      getLogger().info("[chatStream] switching to CDP proxy (non-streaming)...");
+      const { chromium } = await import("playwright");
+      const browser = await chromium.connectOverCDP("http://127.0.0.1:60131");
+      const context = browser.contexts()[0];
+      const page = context.pages()[0] || await context.newPage();
+
+      await page.goto(`https://chat.qwen.ai/c/${chatId}`, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+
+      const result = await page.evaluate(async ({ url, headers, payload }: {
+        url: string; headers: Record<string, string>; payload: any;
+      }) => {
+        try {
+          // Use non-streaming for CDP fallback
+          const p = { ...payload, stream: false };
+          const resp = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(p),
+            credentials: "include",
+          });
+          const data = await resp.json();
+          return JSON.stringify({ ok: resp.ok, status: resp.status, data });
+        } catch (e: any) {
+          return JSON.stringify({ ok: false, error: e.message });
+        }
+      }, { url, headers, payload });
+
+      await browser.close().catch(() => {});
+
+      const parsed = JSON.parse(result);
+      if (parsed.ok && parsed.data?.choices?.length) {
+        const choice = parsed.data.choices[0];
+        const content = choice?.message?.content || choice?.delta?.content || "";
+        const reasoning = choice?.message?.reasoning_content || choice?.delta?.reasoning_content || "";
+        if (content) yield { type: "text", content };
+        if (reasoning) yield { type: "thinking", content: reasoning };
+        return;
+      }
+
+      getLogger().warn({ result: parsed }, "[chatStream] CDP proxy failed");
+      yield { type: "error", content: "CDP proxy: unexpected response" };
+    } catch (cdpErr: any) {
+      getLogger().warn({ err: cdpErr }, "[chatStream] CDP proxy error");
+      yield { type: "error", content: cdpErr?.message || "CDP proxy error" };
     }
   }
 
